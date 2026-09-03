@@ -1,0 +1,46 @@
+#include <DHT.h>
+
+#define SW_WATER 5
+#define DHT_PIN 4
+#define DHT_TYPE DHT22
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SW_WATER, OUTPUT);
+  digitalWrite(SW_WATER, LOW);
+
+  dht.begin();
+
+  Serial.println("ESP32-C3 Smart Seedling Watering");
+  Serial.println("System started");
+}
+
+void loop() {
+  // Blink LED
+  digitalWrite(SW_WATER, HIGH);
+  delay(1000);
+
+  digitalWrite(SW_WATER, LOW);
+  delay(1000);
+
+  // Read DHT22
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("DHT22: Failed to read");
+  } else {
+    Serial.print("Relative Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" °C");
+  }
+
+  Serial.println("--------------------");
+}
