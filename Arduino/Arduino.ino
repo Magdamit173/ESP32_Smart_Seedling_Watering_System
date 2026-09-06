@@ -3,24 +3,28 @@
 #include <WebServer.h>
 #include <DHT.h>
 #include <Preferences.h>
-#include <esp_sleep.h>
 #include <sys/time.h>
 #include <time.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 #define DHT_PIN 4
 #define WATER_PIN 5
 #define DHT_TYPE DHT22
+#define RTC_SDA 6
+#define RTC_SCL 7
 
 const char* WIFI_SSID = "ESP32_Smart_Seedling_Waterer";
 const uint8_t MAX_EVENTS = 10;
 const uint32_t MAX_DURATION_SEC = 1800;
 const uint32_t SENSOR_INTERVAL_MS = 10000;
-const uint32_t DEEP_SLEEP_GRACE_MS = 60000;
 const uint32_t CONFIG_MAGIC = 0x53454544;
 
 WebServer server(80);
 DHT dht(DHT_PIN, DHT_TYPE);
 Preferences prefs;
+RTC_DS3231 rtc;
+bool rtcAvailable = false;
 
 struct ConditionConfig {
     bool enabled;
@@ -45,7 +49,6 @@ struct EventConfig {
 struct DeviceConfig {
     uint32_t magic;
     bool automationEnabled;
-    bool deepSleepEnabled;
     uint32_t manualDurationSec;
     uint8_t eventCount;
     EventConfig events[MAX_EVENTS];
@@ -53,10 +56,10 @@ struct DeviceConfig {
 
 DeviceConfig config;
 
-RTC_DATA_ATTR int64_t rtcLastScheduleDay[MAX_EVENTS];
-RTC_DATA_ATTR int64_t rtcConditionSince[MAX_EVENTS];
-RTC_DATA_ATTR int64_t rtcLastConditionTrigger[MAX_EVENTS];
-RTC_DATA_ATTR bool rtcStateInitialized;
+int64_t rtcLastScheduleDay[MAX_EVENTS];
+int64_t rtcConditionSince[MAX_EVENTS];
+int64_t rtcLastConditionTrigger[MAX_EVENTS];
+bool rtcStateInitialized = false;
 
 float currentTemperature = NAN;
 float currentHumidity = NAN;
@@ -65,8 +68,6 @@ uint32_t waterStartMs = 0;
 uint32_t waterDurationMs = 0;
 String lastReason = "None";
 uint32_t lastSensorReadMs = 0;
-uint32_t lastHttpActivityMs = 0;
-uint32_t awakeStartMs = 0;
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -131,21 +132,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
         <section class="content-grid">
             <div class="main-column">
-                <section class="panel section-card">
-                    <div class="section-heading">
-                        <div>
-                            <h2>Clock</h2>
-                            <p>24-hour clock. Date is used internally only.</p>
-                        </div>
-                        <button class="button button-secondary" type="button" data-action="sync-time">Sync Device Time</button>
-                    </div>
-                    <div class="clock-box">
-                        <span class="clock-big" id="clock-display">--:--:--</span>
-                        <span class="clock-help">The browser sends its current local time to the ESP32.</span>
-                    </div>
-                </section>
-
-                <section class="panel section-card">
+                        <section class="panel section-card">
                     <div class="section-heading">
                         <div>
                             <h2>Scheduled Watering</h2>
@@ -187,21 +174,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                         </select>
                     </div>
                     <button class="button button-success button-large" type="button" data-action="manual-water">WATER NOW</button>
+                    <button class="button button-danger button-large" type="button" data-action="force-stop">FORCE STOP WATERING</button>
                     <p class="safety-note">Hard limit: <strong>30 minutes</strong> maximum watering time.</p>
-                </section>
-
-                <section class="panel section-card">
-                    <div class="section-heading compact">
-                        <div>
-                            <h2>Power Saving</h2>
-                            <p>Deep sleep can reduce power use while the controller is idle.</p>
-                        </div>
-                    </div>
-                    <label class="switch-row">
-                        <input type="checkbox" id="deep-sleep-toggle">
-                        <span>Enable Deep Sleep</span>
-                    </label>
-                    <p class="safety-note">While sleeping, Wi-Fi is unavailable. The ESP32 wakes itself with its RTC timer. Full power removal still turns the ESP32 off.</p>
                 </section>
 
                 <section class="panel section-card">
@@ -477,22 +451,6 @@ button {
     font-size: 12px;
 }
 
-.clock-box {
-    margin-top: 14px;
-    padding: 18px;
-    border-radius: 9px;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
-}
-
-.clock-big {
-    display: block;
-    font-family: Consolas, Monaco, monospace;
-    font-size: 36px;
-    font-weight: 800;
-}
-
-.clock-help,
 .safety-note {
     display: block;
     margin-top: 8px;
@@ -729,7 +687,6 @@ const state = {
     baseUrl: 'http://192.168.4.1',
     connected: false,
     automationEnabled: false,
-    deepSleepEnabled: false,
     manualDurationSeconds: 30,
     schedules: [],
     conditions: [],
@@ -741,7 +698,6 @@ const elements = {
     connectionDot: document.querySelector('#connection-dot'),
     connectionLabel: document.querySelector('#connection-label'),
     time: document.querySelector('#status-time'),
-    clock: document.querySelector('#clock-display'),
     clockNote: document.querySelector('#status-clock'),
     temperature: document.querySelector('#status-temperature'),
     humidity: document.querySelector('#status-humidity'),
@@ -752,7 +708,6 @@ const elements = {
     remaining: document.querySelector('#device-remaining'),
     manualDuration: document.querySelector('#manual-duration'),
     manualUnit: document.querySelector('#manual-unit'),
-    deepSleep: document.querySelector('#deep-sleep-toggle'),
     schedules: document.querySelector('#schedule-list'),
     scheduleEmpty: document.querySelector('#schedule-empty'),
     conditions: document.querySelector('#condition-list'),
@@ -1059,17 +1014,15 @@ function render() {
     elements.manualUnit.value = state.manualDurationSeconds >= 60 && state.manualDurationSeconds % 60 === 0
         ? 'minutes'
         : 'seconds'
-    elements.deepSleep.checked = state.deepSleepEnabled
 }
 
 function stateFromStatus(status) {
     if (status.automation !== undefined) state.automationEnabled = Boolean(status.automation)
-    if (status.deepSleep !== undefined) state.deepSleepEnabled = Boolean(status.deepSleep)
 }
 
 function updateStatus(status) {
     stateFromStatus(status)
-    elements.temperature.textContent = status.temperature === null ? '--' : `${Number(status.temperature).toFixed(1)} °C`
+    elements.temperature.textContent = status.temperature === null ? '--' : `${Number(status.temperature).toFixed(1)} \u00B0C`
     elements.humidity.textContent = status.humidity === null ? '--' : `${Number(status.humidity).toFixed(1)} %`
     elements.water.textContent = status.water ? 'ON' : 'OFF'
     elements.waterTime.textContent = status.water ? `${Number(status.remaining).toFixed(0)} s remaining` : 'Ready'
@@ -1078,15 +1031,12 @@ function updateStatus(status) {
     elements.remaining.textContent = `${Number(status.remaining || 0).toFixed(0)} s`
     const timeText = status.time || '--:--:--'
     elements.time.textContent = timeText
-    elements.clock.textContent = timeText
-    elements.clockNote.textContent = status.timeValid ? 'Clock synced' : 'Clock not synced'
-    elements.deepSleep.checked = state.deepSleepEnabled
+    elements.clockNote.textContent = status.timeValid ? (status.rtc ? 'DS3231 RTC active' : 'Clock active') : 'Clock not synced'
 }
 
 function saveLocal() {
     const payload = {
         automationEnabled: state.automationEnabled,
-        deepSleepEnabled: state.deepSleepEnabled,
         manualDurationSeconds: state.manualDurationSeconds,
         schedules: state.schedules,
         conditions: state.conditions
@@ -1099,21 +1049,16 @@ function loadLocal() {
         const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null')
         if (!saved) return
         state.automationEnabled = Boolean(saved.automationEnabled)
-        state.deepSleepEnabled = Boolean(saved.deepSleepEnabled)
-        state.manualDurationSeconds = Math.min(MAX_DURATION_SECONDS, Number(saved.manualDurationSeconds) || 30)
+            state.manualDurationSeconds = Math.min(MAX_DURATION_SECONDS, Number(saved.manualDurationSeconds) || 30)
         state.schedules = Array.isArray(saved.schedules) ? saved.schedules : []
         state.conditions = Array.isArray(saved.conditions) ? saved.conditions : []
     } catch {
-        state.schedules = []
-        state.conditions = []
+        return
     }
 }
 
 async function syncTime() {
-    if (!state.connected) {
-        log('Connect to the ESP32 first')
-        return
-    }
+    if (!state.connected) return
     const now = new Date()
     const localEpoch = Math.floor(Date.UTC(
         now.getFullYear(),
@@ -1126,18 +1071,17 @@ async function syncTime() {
     try {
         const response = await request(`/api/time?unix=${localEpoch}`, { method: 'POST' })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
-        log('Device clock synchronized')
+        log('Device clock synchronized automatically')
         refreshStatus()
     } catch (error) {
-        log(`Clock sync failed: ${error.message}`)
+        log(`Automatic clock sync failed: ${error.message}`)
     }
 }
 
 function serializeConfig() {
     const lines = [
         `A|${state.automationEnabled ? 1 : 0}`,
-        `M|${Math.min(MAX_DURATION_SECONDS, state.manualDurationSeconds)}`,
-        `D|${state.deepSleepEnabled ? 1 : 0}`
+        `M|${Math.min(MAX_DURATION_SECONDS, state.manualDurationSeconds)}`
     ]
 
     state.schedules.slice(0, 10).forEach(event => {
@@ -1172,7 +1116,6 @@ async function saveToESP32() {
     }
     captureManualDuration()
     state.automationEnabled = state.automationEnabled
-    state.deepSleepEnabled = elements.deepSleep.checked
     saveLocal()
     try {
         const response = await request('/api/config', {
@@ -1191,31 +1134,36 @@ async function saveToESP32() {
 async function loadFromESP32() {
     if (!state.connected) return
     try {
-        const response = await request('/api/config')
+        const response = await request('/api/config', { cache: 'no-store' })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const text = await response.text()
-        parseConfig(text)
-        render()
-        saveLocal()
-        log('Configuration loaded from ESP32')
+        const serverConfig = parseConfig(text, true)
+        if (serverConfig.hasSavedConfig) {
+            parseConfig(text, false)
+            render()
+            saveLocal()
+            log(`Configuration loaded from ESP32: ${serverConfig.schedules} scheduled, ${serverConfig.conditions} environmental`)
+        } else {
+            render()
+            saveLocal()
+            log('ESP32 has no saved watering rules yet')
+        }
     } catch (error) {
         log(`Load failed: ${error.message}`)
     }
 }
 
-function parseConfig(text) {
+function parseConfig(text, inspectOnly = false) {
     const schedules = []
     const conditions = []
     let automation = false
     let manual = 30
-    let deepSleep = false
 
     text.split(/\r?\n/).forEach(line => {
         const parts = line.trim().split('|')
         if (!parts[0]) return
         if (parts[0] === 'A') automation = parts[1] === '1'
         if (parts[0] === 'M') manual = Math.min(MAX_DURATION_SECONDS, Number(parts[1]) || 30)
-        if (parts[0] === 'D') deepSleep = parts[1] === '1'
         if (parts[0] !== 'E') return
 
         if (parts[1] === 'S') {
@@ -1244,11 +1192,16 @@ function parseConfig(text) {
         }
     })
 
-    state.automationEnabled = automation
-    state.manualDurationSeconds = manual
-    state.deepSleepEnabled = deepSleep
-    state.schedules = schedules
-    state.conditions = conditions
+    const hasSavedConfig = schedules.length > 0 || conditions.length > 0 || automation || manual !== 30
+
+    if (!inspectOnly || hasSavedConfig) {
+        state.automationEnabled = automation
+        state.manualDurationSeconds = manual
+        state.schedules = schedules
+        state.conditions = conditions
+    }
+
+    return { hasSavedConfig, schedules: schedules.length, conditions: conditions.length }
 }
 
 async function connect() {
@@ -1324,6 +1277,21 @@ async function manualWater() {
     }
 }
 
+async function forceStopWatering() {
+    if (!state.connected) {
+        log('Connect to the ESP32 first')
+        return
+    }
+    try {
+        const response = await request('/api/force-stop', { method: 'POST' })
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        log('Watering force stopped')
+        refreshStatus()
+    } catch (error) {
+        log(`Force stop failed: ${error.message}`)
+    }
+}
+
 async function setAutomation(enabled) {
     state.automationEnabled = enabled
     saveLocal()
@@ -1375,11 +1343,11 @@ document.addEventListener('click', event => {
     const name = action.dataset.action
     if (name === 'connect') connect()
     if (name === 'disconnect') disconnect()
-    if (name === 'sync-time') syncTime()
     if (name === 'save') saveToESP32()
     if (name === 'run') setAutomation(true)
     if (name === 'stop') setAutomation(false)
     if (name === 'manual-water') manualWater()
+    if (name === 'force-stop') forceStopWatering()
     if (name === 'add-schedule') addSchedule()
     if (name === 'add-condition') addCondition()
     if (name === 'clear-log') clearLog()
@@ -1395,20 +1363,11 @@ elements.manualUnit.addEventListener('change', () => {
     saveLocal()
 })
 
-elements.deepSleep.addEventListener('change', () => {
-    state.deepSleepEnabled = elements.deepSleep.checked
-    saveLocal()
-})
-
 loadLocal()
 render()
 log('Ready')
 
 )rawliteral";
-
-void touchActivity() {
-    lastHttpActivityMs = millis();
-}
 
 void addCors() {
     server.sendHeader("Access-Control-Allow-Origin", "*", true);
@@ -1436,27 +1395,82 @@ String jsonEscape(const String& value) {
 }
 
 bool timeValid() {
-    return time(nullptr) > 1700000000;
+    if (!rtcAvailable) return false;
+    DateTime now = rtc.now();
+    return now.year() >= 2024;
+}
+
+int64_t rtcUnixTime() {
+    if (!timeValid()) return -1;
+    return (int64_t)rtc.now().unixtime();
 }
 
 int64_t dayKey() {
-    if (!timeValid()) return -1;
-    return (int64_t)(time(nullptr) / 86400);
+    int64_t unixNow = rtcUnixTime();
+    if (unixNow < 0) return -1;
+    return unixNow / 86400LL;
 }
 
 int secondsOfDay() {
     if (!timeValid()) return -1;
-    return (int)(time(nullptr) % 86400);
+    DateTime now = rtc.now();
+    return now.hour() * 3600 + now.minute() * 60 + now.second();
 }
 
 String formatTime() {
     if (!timeValid()) return "--:--:--";
-    time_t now = time(nullptr);
-    struct tm tmNow;
-    gmtime_r(&now, &tmNow);
+    DateTime now = rtc.now();
     char buffer[12];
-    snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
+    snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
     return String(buffer);
+}
+
+bool initRtc() {
+    Wire.begin(RTC_SDA, RTC_SCL);
+    Wire.setClock(100000);
+    delay(10);
+
+    bool busSeesRtc = false;
+    for (uint8_t attempt = 0; attempt < 3; attempt++) {
+        Wire.beginTransmission(0x68);
+        uint8_t error = Wire.endTransmission();
+        if (error == 0) {
+            busSeesRtc = true;
+            break;
+        }
+        delay(20);
+    }
+
+    Serial.print("I2C 0x68: ");
+    Serial.println(busSeesRtc ? "DETECTED" : "NOT DETECTED");
+
+    if (!busSeesRtc) return false;
+
+    if (!rtc.begin(&Wire)) {
+        Serial.println("RTClib could not initialize DS3231.");
+        return false;
+    }
+
+    rtc.disable32K();
+    rtc.writeSqwPinMode(DS3231_OFF);
+    return true;
+}
+
+bool syncSystemClockFromRtc() {
+    if (!rtcAvailable || !timeValid()) return false;
+    DateTime now = rtc.now();
+    struct timeval tv;
+    tv.tv_sec = (time_t)now.unixtime();
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    return true;
+}
+
+void setRtcFromUnix(int64_t unixTime) {
+    if (!rtcAvailable || unixTime <= 0) return;
+    DateTime value((uint32_t)unixTime);
+    rtc.adjust(value);
+    syncSystemClockFromRtc();
 }
 
 void clearRtcEventState() {
@@ -1477,7 +1491,6 @@ void loadConfig() {
     if (!valid || config.magic != CONFIG_MAGIC || config.eventCount > MAX_EVENTS) {
         config.magic = CONFIG_MAGIC;
         config.automationEnabled = false;
-        config.deepSleepEnabled = false;
         config.manualDurationSec = 30;
         config.eventCount = 0;
     }
@@ -1544,7 +1557,6 @@ bool applyConfigText(const String& text) {
     DeviceConfig next = config;
     next.eventCount = 0;
     next.automationEnabled = false;
-    next.deepSleepEnabled = false;
     next.manualDurationSec = 30;
     memset(next.events, 0, sizeof(next.events));
 
@@ -1567,10 +1579,6 @@ bool applyConfigText(const String& text) {
         }
         if (fields[0] == "M" && count >= 2) {
             next.manualDurationSec = constrain((uint32_t)fields[1].toInt(), 1UL, MAX_DURATION_SEC);
-            continue;
-        }
-        if (fields[0] == "D" && count >= 2) {
-            next.deepSleepEnabled = parseBoolField(fields[1]);
             continue;
         }
         if (fields[0] != "E" || count < 2 || next.eventCount >= MAX_EVENTS) continue;
@@ -1626,8 +1634,7 @@ String configText() {
     text += config.automationEnabled ? "1\n" : "0\n";
     text += "M|";
     text += String(config.manualDurationSec);
-    text += "\nD|";
-    text += config.deepSleepEnabled ? "1\n" : "0\n";
+    text += "\n";
 
     for (uint8_t i = 0; i < config.eventCount; i++) {
         const EventConfig& event = config.events[i];
@@ -1776,66 +1783,18 @@ void processConditionEvents() {
         uint32_t nowMs = millis();
         if (rtcConditionSince[i] < 0) rtcConditionSince[i] = (int64_t)nowMs;
 
-        int64_t elapsed = (int64_t)((uint32_t)nowMs - (uint32_t)rtcConditionSince[i]) / 1000LL;
-        if (elapsed < (int64_t)event.persistenceSec) continue;
+        uint32_t elapsedMs = (uint32_t)(nowMs - (uint32_t)rtcConditionSince[i]);
+        if ((uint64_t)elapsedMs < (uint64_t)event.persistenceSec * 1000ULL) continue;
 
         if (rtcLastConditionTrigger[i] >= 0) {
-            int64_t sinceTrigger = (int64_t)((uint32_t)nowMs - (uint32_t)rtcLastConditionTrigger[i]) / 1000LL;
-            if (sinceTrigger < (int64_t)event.cooldownSec) continue;
+            uint32_t sinceTriggerMs = (uint32_t)(nowMs - (uint32_t)rtcLastConditionTrigger[i]);
+            if ((uint64_t)sinceTriggerMs < (uint64_t)event.cooldownSec * 1000ULL) continue;
         }
 
         rtcLastConditionTrigger[i] = (int64_t)nowMs;
-        rtcConditionSince[i] = (int64_t)nowMs;
         startWatering(event.durationSec, "Environmental rule");
         return;
     }
-}
-
-uint32_t nextSleepSeconds() {
-    if (!timeValid()) return 60;
-    if (!config.automationEnabled) return 3600;
-
-    bool hasCondition = false;
-    int64_t minWait = INT64_MAX;
-    int nowSec = secondsOfDay();
-    int64_t today = dayKey();
-
-    for (uint8_t i = 0; i < config.eventCount; i++) {
-        EventConfig& event = config.events[i];
-        if (!event.enabled) continue;
-        if (event.type == 1) {
-            hasCondition = true;
-            continue;
-        }
-        String timeText = String(event.time);
-        if (timeText.length() < 5) continue;
-        int h = timeText.substring(0, 2).toInt();
-        int m = timeText.substring(3, 5).toInt();
-        int target = h * 3600 + m * 60;
-        int64_t wait = target - nowSec;
-        if (wait <= 0 || rtcLastScheduleDay[i] == today) wait += 86400;
-        if (wait < minWait) minWait = wait;
-    }
-
-    if (hasCondition) return 10;
-    if (minWait == INT64_MAX) return 3600;
-    return (uint32_t)constrain((long)minWait, 1L, 21600L);
-}
-
-void maybeDeepSleep() {
-    if (!config.deepSleepEnabled || waterState) return;
-    if (millis() - awakeStartMs < DEEP_SLEEP_GRACE_MS) return;
-    if (millis() - lastHttpActivityMs < DEEP_SLEEP_GRACE_MS) return;
-
-    uint32_t sleepSeconds = nextSleepSeconds();
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_OFF);
-    esp_sleep_enable_timer_wakeup((uint64_t)sleepSeconds * 1000000ULL);
-    Serial.print("Deep sleep for ");
-    Serial.print(sleepSeconds);
-    Serial.println(" seconds");
-    Serial.flush();
-    esp_deep_sleep_start();
 }
 
 void setupWifi() {
@@ -1862,10 +1821,10 @@ void sendStatus() {
     json += String(remaining);
     json += ",\"automation\":";
     json += config.automationEnabled ? "true" : "false";
-    json += ",\"deepSleep\":";
-    json += config.deepSleepEnabled ? "true" : "false";
     json += ",\"timeValid\":";
     json += timeValid() ? "true" : "false";
+    json += ",\"rtc\":";
+    json += rtcAvailable ? "true" : "false";
     json += ",\"time\":\"";
     json += formatTime();
     json += "\",\"reason\":\"";
@@ -1882,32 +1841,31 @@ void sendStatus() {
 
 void setupRoutes() {
     server.on("/", HTTP_GET, []() {
-        touchActivity();
-        server.send_P(200, "text/html", INDEX_HTML);
+        server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
     });
 
     server.on("/style.css", HTTP_GET, []() {
-        touchActivity();
-        server.send_P(200, "text/css", STYLE_CSS);
+        server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        server.send_P(200, "text/css; charset=utf-8", STYLE_CSS);
     });
 
     server.on("/app.js", HTTP_GET, []() {
-        touchActivity();
-        server.send_P(200, "application/javascript", APP_JS);
+        server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        server.send_P(200, "application/javascript; charset=utf-8", APP_JS);
     });
 
     server.on("/api/status", HTTP_GET, []() {
-        touchActivity();
         sendStatus();
     });
 
     server.on("/api/config", HTTP_GET, []() {
-        touchActivity();
-        sendText(200, configText());
+        addCors();
+        server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        server.send(200, "text/plain", configText());
     });
 
     server.on("/api/config", HTTP_POST, []() {
-        touchActivity();
         if (!applyConfigText(server.arg("plain"))) {
             sendJson(400, "{\"error\":\"Invalid configuration\"}");
             return;
@@ -1916,23 +1874,23 @@ void setupRoutes() {
     });
 
     server.on("/api/time", HTTP_POST, []() {
-        touchActivity();
         if (!server.hasArg("unix")) {
             sendJson(400, "{\"error\":\"Missing unix time\"}");
             return;
         }
         bool wasValid = timeValid();
-        time_t value = (time_t)strtoll(server.arg("unix").c_str(), nullptr, 10);
-        struct timeval tv;
-        tv.tv_sec = value;
-        tv.tv_usec = 0;
-        settimeofday(&tv, nullptr);
-        if (!wasValid) markScheduleStateAfterClockSync();
+        int64_t value = strtoll(server.arg("unix").c_str(), nullptr, 10);
+        if (!rtcAvailable) {
+            sendJson(503, "{\"error\":\"RTC unavailable\"}");
+            return;
+        }
+        setRtcFromUnix(value);
+        if (!wasValid) clearRtcEventState();
+        markScheduleStateAfterClockSync();
         sendJson(200, "{\"ok\":true}");
     });
 
     server.on("/api/manual", HTTP_POST, []() {
-        touchActivity();
         uint32_t duration = config.manualDurationSec;
         if (server.hasArg("duration")) duration = (uint32_t)server.arg("duration").toInt();
         duration = constrain(duration, 1UL, MAX_DURATION_SEC);
@@ -1942,15 +1900,18 @@ void setupRoutes() {
         sendJson(200, "{\"ok\":true}");
     });
 
+    server.on("/api/force-stop", HTTP_POST, []() {
+        stopWatering("Force stopped");
+        sendJson(200, "{\"ok\":true}");
+    });
+
     server.on("/api/run", HTTP_POST, []() {
-        touchActivity();
         config.automationEnabled = true;
         saveConfig();
         sendJson(200, "{\"ok\":true}");
     });
 
     server.on("/api/stop", HTTP_POST, []() {
-        touchActivity();
         config.automationEnabled = false;
         saveConfig();
         stopWatering("Automation stopped");
@@ -1958,7 +1919,6 @@ void setupRoutes() {
     });
 
     server.onNotFound([]() {
-        touchActivity();
         if (server.method() == HTTP_OPTIONS) {
             addCors();
             server.send(204);
@@ -1979,6 +1939,16 @@ void setup() {
     prefs.begin("seedling", false);
     loadConfig();
 
+    rtcAvailable = initRtc();
+    if (rtcAvailable) {
+        if (rtc.lostPower()) {
+            Serial.println("RTC lost power. Waiting for time synchronization.");
+        }
+        syncSystemClockFromRtc();
+    } else {
+        Serial.println("DS3231 RTC not detected.");
+    }
+
     if (!rtcStateInitialized) {
         clearRtcEventState();
         rtcStateInitialized = true;
@@ -1988,8 +1958,6 @@ void setup() {
     setupRoutes();
     server.begin();
 
-    awakeStartMs = millis();
-    lastHttpActivityMs = millis();
     readSensors();
 
     Serial.println();
@@ -2002,6 +1970,9 @@ void setup() {
     Serial.println(WiFi.softAPIP());
     Serial.println("24-hour schedule enabled");
     Serial.println("Maximum watering duration: 30 minutes");
+    Serial.print("DS3231: ");
+    Serial.println(rtcAvailable ? (timeValid() ? "OK" : "CONNECTED, TIME NOT SET") : "NOT DETECTED");
+    Serial.println("I2C: SDA GPIO6, SCL GPIO7");
 }
 
 void loop() {
@@ -2014,6 +1985,5 @@ void loop() {
         if (!waterState) processConditionEvents();
     }
 
-    maybeDeepSleep();
     delay(1);
 }
